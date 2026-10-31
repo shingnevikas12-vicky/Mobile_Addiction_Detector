@@ -1,0 +1,332 @@
+package ly.com.tahaben.launcher_data.service
+
+import android.app.AlarmManager
+import android.app.PendingIntent
+import android.app.Service
+import android.app.usage.UsageStatsManager
+import android.content.Context
+import android.content.Intent
+import android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+import android.graphics.PixelFormat
+import android.os.Build
+import android.os.IBinder
+import android.os.PowerManager
+import android.os.SystemClock
+import android.view.WindowManager
+import android.widget.Toast
+import androidx.annotation.StringRes
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.AlertDialogDefaults
+import androidx.compose.material3.BottomSheetDefaults
+import androidx.compose.material3.Button
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.ComposeView
+import androidx.compose.ui.res.stringResource
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import ly.com.tahaben.core.R
+import ly.com.tahaben.core.service.RunningService
+import ly.com.tahaben.core.service.RunningServicesNotifier
+import ly.com.tahaben.core_ui.LocalSpacing
+import ly.com.tahaben.core_ui.theme.FarhanTheme
+import ly.com.tahaben.core_ui.use_cases.UiUseCases
+import ly.com.tahaben.core_ui.util.attachOverlay
+import ly.com.tahaben.core_ui.util.isCurrentlyDark
+import ly.com.tahaben.launcher_domain.model.TimeLimit
+import ly.com.tahaben.launcher_domain.use_case.time_limit.TimeLimitUseCases
+import timber.log.Timber
+import javax.inject.Inject
+import kotlin.time.Duration.Companion.minutes
+
+/**
+ * Created by Taha Ben Ashur (https://github.com/tahaak67) on 11,Feb,2023
+ */
+@AndroidEntryPoint
+class TimeLimitService : Service() {
+
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var isServiceStarted = false
+    private var serviceScope: CoroutineScope? = null
+    private var timeLimitedApps: HashMap<String, TimeLimit> = hashMapOf()
+
+    @Inject
+    lateinit var timeLimitUseCases: TimeLimitUseCases
+
+    @Inject
+    lateinit var uiUseCases: UiUseCases
+
+    @Inject
+    lateinit var runningServicesNotifier: RunningServicesNotifier
+
+
+    override fun onBind(intent: Intent): IBinder? {
+        Timber.d("Some component want to bind with the service")
+        // We don't provide binding, so return null
+        return null
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        Timber.d("onStartCommand executed with startId: $startId")
+        if (intent != null) {
+            val action = intent.action
+            Timber.d("using an intent with action $action")
+            when (action) {
+                Actions.START.name -> startService()
+                Actions.STOP.name -> stopService()
+                else -> Timber.d("This should never happen. No action in the received intent")
+            }
+        } else {
+            Timber.d(
+                "with a null intent. It has been probably restarted by the system."
+            )
+        }
+        // by returning this we make sure the service is restarted if the system kills the service
+        return START_STICKY
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        Timber.d("The service has been created")
+        runningServicesNotifier.serviceStarted(RunningService.TIME_LIMITER)
+        val notification = runningServicesNotifier.buildNotification()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(
+                RunningServicesNotifier.NOTIFICATION_ID,
+                notification,
+                FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+            )
+        } else {
+            startForeground(RunningServicesNotifier.NOTIFICATION_ID, notification)
+        }
+        serviceScope = CoroutineScope(Dispatchers.IO)
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        serviceScope = null
+        runningServicesNotifier.serviceStopped(RunningService.TIME_LIMITER)
+        Timber.d("The service has been destroyed")
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent) {
+        val restartServiceIntent = Intent(applicationContext, TimeLimitService::class.java).also {
+            it.setPackage(packageName)
+        }
+        val restartServicePendingIntent: PendingIntent =
+            PendingIntent.getService(this, 1, restartServiceIntent, PendingIntent.FLAG_IMMUTABLE)
+        applicationContext.getSystemService(Context.ALARM_SERVICE)
+        val alarmService: AlarmManager =
+            applicationContext.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        alarmService.set(
+            AlarmManager.ELAPSED_REALTIME,
+            SystemClock.elapsedRealtime() + 1000,
+            restartServicePendingIntent
+        )
+    }
+
+    private fun startService() {
+        if (isServiceStarted) return
+        Timber.d("Starting the foreground service task")
+        isServiceStarted = true
+        // setServiceState(this, ServiceState.STARTED)
+
+        // we need this lock so our service gets not affected by Doze Mode
+        wakeLock =
+            (getSystemService(Context.POWER_SERVICE) as PowerManager).run {
+                newWakeLock(
+                    PowerManager.PARTIAL_WAKE_LOCK,
+                    "${this@TimeLimitService::class.java.name}::lock"
+                ).apply {
+                    acquire(10.minutes.inWholeMilliseconds)
+                }
+            }
+
+        // we're starting a loop in a coroutine
+        serviceScope?.launch {
+            while (isServiceStarted) {
+                if (timeLimitUseCases.isTimeLimiterEnabled()) {
+                    val packageName = getForegroundAppPackageName(this@TimeLimitService)
+                    Timber.d("foreground pkg: $packageName")
+                    packageName?.let {
+                        val newLimit =
+                            timeLimitUseCases.getTimeLimitForPackage(packageName)
+                        if (newLimit != null) {
+                            timeLimitedApps[newLimit.packageName] = newLimit
+                            timeLimitUseCases.removeTimeLimitFromDb(newLimit)
+                        }
+                        Timber.d("newLimit: $newLimit")
+                        if (timeLimitedApps.contains(packageName)) {
+                                Timber.d("newLimit: contains!")
+                                val timedApp = timeLimitedApps[packageName]!!
+                                if (System.currentTimeMillis() - timedApp.timeAtAddingInMilli >= timedApp.timeLimitInMilli) {
+                                    withContext(Dispatchers.Main) {
+                                        showTimeUpDialog(timedApp)
+                                    }
+                                    timeLimitedApps.remove(packageName)
+                                    Timber.d("newLimit: time to show dialog :D")
+                                }
+                            }
+
+                    }
+                    delay(1000)
+                }
+            }
+            Timber.d("End of the loop for the service")
+        }
+    }
+
+    private fun stopService() {
+        Timber.d("Stopping the foreground service")
+        try {
+            wakeLock?.let {
+                if (it.isHeld) {
+                    it.release()
+                }
+            }
+            stopForeground(true)
+            stopSelf()
+        } catch (e: Exception) {
+            Timber.d("Service stopped without being started: ${e.message}")
+        }
+        isServiceStarted = false
+    }
+
+
+    private fun getForegroundAppPackageName(context: Context): String? {
+        val usageStatsManager =
+            context.getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
+        val currentTime = System.currentTimeMillis()
+        val usageStatsList = usageStatsManager.queryUsageStats(
+            UsageStatsManager.INTERVAL_BEST,
+            currentTime - 1900 * 100,
+            currentTime
+        )
+        if (usageStatsList.isEmpty()) {
+            return null
+        }
+
+        val sortedList = usageStatsList.sortedBy { it.lastTimeUsed }
+        val currentPackageName = sortedList.last().packageName
+
+        return currentPackageName
+    }
+
+
+    enum class Actions {
+        START,
+        STOP
+    }
+
+    private val windowManager get() = getSystemService(WINDOW_SERVICE) as WindowManager
+
+    @OptIn(ExperimentalMaterial3Api::class)
+    private fun showTimeUpDialog(timeLimit: TimeLimit) {
+        val layoutFlag: Int = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        } else {
+            WindowManager.LayoutParams.TYPE_PHONE
+        }
+        val isDarkMode = uiUseCases.isDarkModeEnabled()
+        val themeColors = uiUseCases.getCurrentThemeColors()
+        val params = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.MATCH_PARENT,
+            layoutFlag,
+            WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            PixelFormat.TRANSLUCENT
+        )
+        val composeView = ComposeView(this)
+        composeView.setContent {
+            FarhanTheme(darkMode = isDarkMode.isCurrentlyDark(), colorStyle = themeColors) {
+                fun dismiss() {
+                    windowManager.removeView(composeView)
+                }
+
+                val spacing = LocalSpacing.current
+                // The window is MATCH_PARENT so the composition root gets tight full-screen
+                // constraints; this Box loosens them so the dialog card can wrap its content,
+                // and doubles as the dialog scrim.
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(BottomSheetDefaults.ScrimColor),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Surface(
+                        modifier = Modifier.padding(spacing.spaceLarge),
+                        shape = MaterialTheme.shapes.extraLarge,
+                        tonalElevation = AlertDialogDefaults.TonalElevation,
+                        color = MaterialTheme.colorScheme.surface,
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(spacing.spaceMedium),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(spacing.spaceMedium)
+                        ) {
+                            Text(stringResource(R.string.time_is_up))
+                            Button(onClick = {
+                                dismiss()
+                                this@TimeLimitService.startActivity(
+                                    Intent(Intent.ACTION_MAIN)
+                                        .addCategory(Intent.CATEGORY_HOME)
+                                        .apply { flags = Intent.FLAG_ACTIVITY_NEW_TASK }
+                                )
+                            }) {
+                                Text(stringResource(R.string.take_me_out_of_here))
+                            }
+                            Text(stringResource(R.string.or_add_more_time))
+                            Row(horizontalArrangement = Arrangement.spacedBy(spacing.spaceMedium)) {
+                                Button(onClick = {
+                                    timeLimitedApps[timeLimit.packageName] = timeLimit.copy(
+                                        timeAtAddingInMilli = System.currentTimeMillis(),
+                                        timeLimitInMilli = 1.minutes.inWholeMilliseconds
+                                    )
+                                    dismiss()
+                                    showToast(R.string.will_remind_you_in_one_min)
+                                }) { Text(stringResource(R.string.one_min)) }
+                                Button(onClick = {
+                                    timeLimitedApps[timeLimit.packageName] = timeLimit.copy(
+                                        timeAtAddingInMilli = System.currentTimeMillis(),
+                                        timeLimitInMilli = 3.minutes.inWholeMilliseconds
+                                    )
+                                    dismiss()
+                                    showToast(R.string.will_remind_you_in_three_min)
+                                }) { Text(stringResource(R.string.three_min)) }
+                                Button(onClick = {
+                                    timeLimitedApps[timeLimit.packageName] = timeLimit.copy(
+                                        timeAtAddingInMilli = System.currentTimeMillis(),
+                                        timeLimitInMilli = 5.minutes.inWholeMilliseconds
+                                    )
+                                    dismiss()
+                                    showToast(R.string.will_remind_you_in_five_min)
+                                }) { Text(stringResource(R.string.five_min)) }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Attach the Compose overlay with a real lifecycle/ViewModelStore (see core_ui ComposeOverlay).
+        composeView.attachOverlay(windowManager, params)
+    }
+
+    private fun showToast(@StringRes string: Int) {
+        Toast.makeText(this, string, Toast.LENGTH_LONG).show()
+    }
+
+}

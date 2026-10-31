@@ -1,0 +1,49 @@
+package ly.com.tahaben.notification_filter_domain.preferences
+
+import ly.com.tahaben.notification_filter_domain.model.FilterSchedule
+import java.time.DayOfWeek
+import java.time.LocalTime
+
+interface Preferences {
+
+    fun loadShouldShowOnBoarding(): Boolean
+    fun saveShouldShowOnBoarding(shouldShow: Boolean)
+    fun loadShouldShowcase(): Boolean
+    fun saveShouldShowcase(shouldShow: Boolean)
+    suspend fun isServiceEnabled(): Boolean
+    fun setServiceState(isEnabled: Boolean)
+    fun savePackageToNotificationExceptions(packageName: String)
+    fun removePackageFromNotificationExceptions(packageName: String)
+    fun isPackageInNotificationExceptions(packageName: String): Boolean
+    fun getNotificationFilterExceptionsList(): Set<String>
+    fun setNotifyMeTime(hour: Int, minutes: Int)
+    fun isNotifyMeScheduledToday(): Boolean
+    fun setNotifyMeScheduledDate(date: Long)
+    fun getNotifyMeHours(): Int
+    fun getNotifyMeMinutes(): Int
+    fun getSettingsShouldShowWarning(): Boolean
+    fun setSettingsShouldShowWarning(shouldShow: Boolean)
+    fun getFilterSchedule(): FilterSchedule
+    fun setFilterScheduleEnabled(isEnabled: Boolean)
+    fun setFilterScheduleDays(days: Set<DayOfWeek>)
+    fun setFilterScheduleStartTime(time: LocalTime)
+    fun setFilterScheduleEndTime(time: LocalTime)
+
+
+    companion object {
+        const val KEY_NOTIFICATION_SERVICE_STATS = "notification_service_stats"
+        const val KEY_NOTIFICATION_FILTER_EXCEPTIONS = "notification_filter_exceptions"
+        const val KEY_NOTIFY_ME_SCHEDULE_DATE = "notify_me_schedule_date"
+        const val KEY_NOTIFY_ME_HOUR = "notify_me_hour"
+        const val KEY_NOTIFY_ME_MINUTE = "notify_me_minute"
+        const val KEY_NOTIFICATION_FILTER_SHOULD_SHOW_ON_BOARDING =
+            "notification_filter_should_show_on_boarding"
+        const val KEY_NOTIFICATION_FILTER_SHOULD_SHOWCASE =
+            "notification_filter_should_showcase"
+        const val KEY_NOTIFICATION_FILTER_WARNING = "notification_filter_settings_warning"
+        const val KEY_NOTIFICATION_FILTER_SCHEDULE_ENABLED = "notification_filter_schedule_enabled"
+        const val KEY_NOTIFICATION_FILTER_SCHEDULE_DAYS = "notification_filter_schedule_days"
+        const val KEY_NOTIFICATION_FILTER_SCHEDULE_START = "notification_filter_schedule_start"
+        const val KEY_NOTIFICATION_FILTER_SCHEDULE_END = "notification_filter_schedule_end"
+    }
+}

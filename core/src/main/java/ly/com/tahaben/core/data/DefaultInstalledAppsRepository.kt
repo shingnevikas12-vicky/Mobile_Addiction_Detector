@@ -1,0 +1,77 @@
+package ly.com.tahaben.core.data
+
+import android.annotation.SuppressLint
+import android.content.Context
+import android.content.pm.ApplicationInfo
+import android.content.pm.PackageManager
+import android.os.Build
+import ly.com.tahaben.core.data.repository.InstalledAppsRepository
+import ly.com.tahaben.core.model.AppItem
+import timber.log.Timber
+import java.util.concurrent.ConcurrentHashMap
+
+class DefaultInstalledAppsRepository(
+    private val context: Context
+) : InstalledAppsRepository {
+
+    private val systemAppCache = ConcurrentHashMap<String, Boolean>()
+
+    @SuppressLint("QueryPermissionsNeeded")
+    override suspend fun getInstalledApps(): List<AppItem> {
+        val pm = context.packageManager
+        val apps = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            pm.getInstalledApplications(PackageManager.ApplicationInfoFlags.of(0))
+        } else {
+            pm.getInstalledApplications(0)
+        }
+        val appItemList = arrayListOf<AppItem>()
+        val isSystemAppMask = ApplicationInfo.FLAG_SYSTEM or ApplicationInfo.FLAG_UPDATED_SYSTEM_APP
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            apps.forEach { ai ->
+                val isSys = (ai.flags and isSystemAppMask) != 0
+                Timber.d("app: ${ai.packageName} isSys: $isSys")
+                appItemList.add(
+                    AppItem(
+                        name = ai.loadLabel(pm) as String,
+                        packageName = ai.packageName,
+                        category = ApplicationInfo.getCategoryTitle(context, ai.category)
+                            ?.toString(),
+                        isSystemApp = isSys
+                    )
+                )
+            }
+        } else {
+            apps.forEach { ai ->
+                appItemList.add(
+                    AppItem(
+                        ai.loadLabel(pm) as String,
+                        ai.packageName,
+                        isSystemApp = (ai.flags and isSystemAppMask) != 0
+                    )
+                )
+            }
+        }
+        return appItemList
+    }
+
+    override fun isSystemApp(packageName: String): Boolean {
+        return systemAppCache.getOrPut(packageName) {
+            try {
+                val ai = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    context.packageManager.getApplicationInfo(
+                        packageName,
+                        PackageManager.ApplicationInfoFlags.of(0)
+                    )
+                } else {
+                    context.packageManager.getApplicationInfo(packageName, 0)
+                }
+                val isSystemAppMask =
+                    ApplicationInfo.FLAG_SYSTEM or ApplicationInfo.FLAG_UPDATED_SYSTEM_APP
+                (ai.flags and isSystemAppMask) != 0
+            } catch (e: PackageManager.NameNotFoundException) {
+                false
+            }
+        }
+    }
+}
